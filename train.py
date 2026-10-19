@@ -63,9 +63,11 @@ def tip_labels(tips: np.ndarray, fares: np.ndarray) -> np.ndarray:
         or np.any(fares <= 0)
     ):
         raise ValueError("Use gorjetas finitas >= 0 e tarifas finitas > 0.")
-    tips_cents, fares_cents = np.rint(tips * 100), np.rint(fares * 100)
     # Margem para converter e multiplicar em int64 sem overflow.
     max_cents = np.iinfo(np.int64).max // 10
+    if np.any(tips > max_cents / 100) or np.any(fares > max_cents / 100):
+        raise ValueError("Valores monetários fora da faixa de centavos suportada.")
+    tips_cents, fares_cents = np.rint(tips * 100), np.rint(fares * 100)
     if (
         np.any(tips_cents > max_cents)
         or np.any(fares_cents > max_cents)
@@ -186,6 +188,10 @@ def train_distributed(
 ) -> tuple[np.ndarray, list[float], float]:
     """Driver coordena processos persistentes com uma partição fixa cada."""
     validate_training(X, y, epochs, learning_rate)
+    if start_method not in {"spawn", "forkserver"}:
+        raise ValueError(
+            "Use spawn ou forkserver para iniciar processos com segurança."
+        )
     if timeout <= 0 or not np.isfinite(timeout):
         raise ValueError("O timeout precisa ser finito e positivo.")
     start = time.perf_counter()
@@ -381,6 +387,8 @@ def prepare_data(
             label_rule="5 * round_even(tip_amount * 100) >= round_even(fare_amount * 100)",
             train_class_counts=np.bincount(y_train.astype(int), minlength=2).tolist(),
             test_class_counts=np.bincount(y_test.astype(int), minlength=2).tolist(),
+            train_positive_fraction=float(y_train.mean()),
+            test_positive_fraction=float(y_test.mean()),
             scaler_mean=scaler.mean_.tolist(),
             scaler_scale=scaler.scale_.tolist(),
         )
@@ -642,7 +650,13 @@ def main() -> None:
     )
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument(
-        "--start-method", choices=mp.get_all_start_methods(), default="spawn"
+        "--start-method",
+        choices=[
+            method
+            for method in mp.get_all_start_methods()
+            if method in {"spawn", "forkserver"}
+        ],
+        default="spawn",
     )
     parser.add_argument("--test-size", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)

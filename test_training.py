@@ -14,6 +14,7 @@ import pandas as pd
 from train import (
     _partition_metrics,
     _receive,
+    _worker,
     loss_and_gradient,
     main,
     prepare_data,
@@ -110,11 +111,13 @@ class TrainingTests(unittest.TestCase):
             ),
         )
 
-    @unittest.skipUnless("fork" in mp.get_all_start_methods(), "fork indisponível")
-    def test_fork_also_matches_sequential(self):
+    @unittest.skipUnless(
+        "forkserver" in mp.get_all_start_methods(), "forkserver indisponível"
+    )
+    def test_forkserver_also_matches_sequential(self):
         expected, loss, _ = train_sequential(self.X, self.y, 3, 0.1)
         actual, actual_loss, _ = train_distributed(
-            self.X, self.y, 2, 3, 0.1, start_method="fork"
+            self.X, self.y, 2, 3, 0.1, start_method="forkserver"
         )
         np.testing.assert_allclose(actual, expected, atol=1e-12)
         np.testing.assert_allclose(actual_loss, loss, atol=1e-12)
@@ -153,6 +156,25 @@ class TrainingTests(unittest.TestCase):
         finally:
             parent.close()
             child.close()
+
+    def test_worker_reports_calculation_error_to_driver(self):
+        context = mp.get_context("spawn")
+        parent, child = context.Pipe()
+        process = context.Process(target=_worker, args=(child, 0, self.X, self.y))
+        process.start()
+        child.close()
+        try:
+            self.assertEqual(_receive(parent, 10)["rows"], len(self.y))
+            parent.send(np.zeros(1))  # Formato incompatível: falha dentro do worker.
+            with self.assertRaisesRegex(RuntimeError, "Falha no worker"):
+                _receive(parent, 10)
+            process.join(10)
+            self.assertFalse(process.is_alive())
+        finally:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+            parent.close()
 
     def test_benchmark_includes_one_process_control_and_train_baseline(self):
         with contextlib.redirect_stdout(io.StringIO()):
@@ -226,7 +248,7 @@ class DataTests(unittest.TestCase):
             ([1], [0]),
             ([-1], [17]),
             ([1], [np.nan]),
-            ([1e30], [17]),
+            ([1e308], [17]),
             ([1], [0.001]),
         ]:
             with self.subTest(tips=tips, fares=fares), self.assertRaises(ValueError):
