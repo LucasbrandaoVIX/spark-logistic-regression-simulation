@@ -1,5 +1,8 @@
-numpy>=1.26
-pandas>=2.1
-pyarrow>=14.0
-scikit-learn>=1.3
-matplotlib>=3.8
+# Validado com Python 3.12.3; use Python 3.12 para reproduzir o experimento.
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==18.1.0
+scikit-learn==1.5.2
+scipy==1.12.0
+matplotlib==3.11.2
+threadpoolctl==3.5.0
