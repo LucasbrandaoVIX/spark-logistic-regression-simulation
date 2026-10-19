@@ -1,0 +1,9 @@
+# Dataset is downloaded/stored on the compute machine, not versioned.
+data/
+*.parquet
+
+# Local Python runtime and generated experiment outputs.
+.venv/
+runtime/
+__pycache__/
+*.py[cod]
