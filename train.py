@@ -10,30 +10,42 @@ from pathlib import Path
 import numpy as np
 
 FEATURES = ["trip_distance", "fare_amount", "passenger_count", "duration_minutes", "pickup_hour"]
-_EPS = 1e-15
 
 
 def sigmoid(z: np.ndarray) -> np.ndarray:
-    z = np.clip(z, -35.0, 35.0)
-    return 1.0 / (1.0 + np.exp(-z))
+    exp_negative_abs = np.exp(-np.abs(z))
+    return np.where(z >= 0, 1 / (1 + exp_negative_abs), exp_negative_abs / (1 + exp_negative_abs))
 
 
 def loss_and_gradient(X: np.ndarray, y: np.ndarray, weights: np.ndarray) -> tuple[float, np.ndarray]:
     """Binary cross-entropy e gradiente médio; weights inclui o intercepto."""
-    Xb = np.column_stack((np.ones(X.shape[0]), X))
-    probabilities = sigmoid(Xb @ weights)
-    loss = -np.mean(y * np.log(probabilities + _EPS) + (1 - y) * np.log(1 - probabilities + _EPS))
-    gradient = Xb.T @ (probabilities - y) / len(y)
-    return float(loss), gradient
+    n, gradient_sum, loss_sum = _partition_metrics(X, y, weights)
+    return loss_sum / n, gradient_sum / n
 
 
 def _partition_metrics(X_part: np.ndarray, y_part: np.ndarray, weights: np.ndarray) -> tuple[int, np.ndarray, float]:
     """Worker: MAP calcula somas locais de gradiente e loss (não médias)."""
-    Xb = np.column_stack((np.ones(X_part.shape[0]), X_part))
-    probabilities = sigmoid(Xb @ weights)
+    logits = X_part @ weights[1:] + weights[0]
+    probabilities = sigmoid(logits)
     errors = probabilities - y_part
-    loss_sum = -np.sum(y_part * np.log(probabilities + _EPS) + (1 - y_part) * np.log(1 - probabilities + _EPS))
-    return len(y_part), Xb.T @ errors, float(loss_sum)
+    loss_sum = np.sum(np.logaddexp(0, logits) - y_part * logits)
+    gradient_sum = np.concatenate(([errors.sum()], X_part.T @ errors))
+    return len(y_part), gradient_sum, float(loss_sum)
+
+
+def tip_labels(tips: np.ndarray, fares: np.ndarray) -> np.ndarray:
+    """Valores em centavos (arredondamento para o par); 5 * gorjeta >= tarifa."""
+    tips, fares = np.asarray(tips, dtype=float), np.asarray(fares, dtype=float)
+    if tips.shape != fares.shape or tips.ndim != 1:
+        raise ValueError("Gorjetas e tarifas devem ser vetores do mesmo tamanho.")
+    if not (np.isfinite(tips).all() and np.isfinite(fares).all()) or np.any(tips < 0) or np.any(fares <= 0):
+        raise ValueError("Use gorjetas finitas >= 0 e tarifas finitas > 0.")
+    tips_cents, fares_cents = np.rint(tips * 100), np.rint(fares * 100)
+    # Margem para converter e multiplicar em int64 sem overflow.
+    max_cents = np.iinfo(np.int64).max // 10
+    if np.any(tips_cents > max_cents) or np.any(fares_cents > max_cents) or np.any(fares_cents < 1):
+        raise ValueError("Valores monetários fora da faixa de centavos suportada.")
+    return (5 * tips_cents.astype(np.int64) >= fares_cents.astype(np.int64)).astype(float)
 
 
 def split_partitions(X: np.ndarray, y: np.ndarray, workers: int) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -47,10 +59,11 @@ def train_sequential(X: np.ndarray, y: np.ndarray, epochs: int, learning_rate: f
     weights = np.zeros(X.shape[1] + 1, dtype=np.float64)
     history: list[float] = []
     start = time.perf_counter()
-    for _ in range(epochs):
+    for epoch in range(epochs + 1):
         loss, gradient = loss_and_gradient(X, y, weights)
         history.append(loss)
-        weights -= learning_rate * gradient
+        if epoch < epochs:
+            weights -= learning_rate * gradient
     return weights, history, time.perf_counter() - start
 
 
@@ -61,7 +74,7 @@ def train_distributed(X: np.ndarray, y: np.ndarray, workers: int, epochs: int, l
     history: list[float] = []
     start = time.perf_counter()
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        for _ in range(epochs):
+        for epoch in range(epochs + 1):
             # BROADCAST simulado: pesos serializados para cada tarefa do worker.
             futures = [pool.submit(_partition_metrics, xp, yp, weights) for xp, yp in parts]
             local_results = [future.result() for future in futures]
@@ -71,7 +84,8 @@ def train_distributed(X: np.ndarray, y: np.ndarray, workers: int, epochs: int, l
             loss_sum = sum(loss for _, _, loss in local_results)
             history.append(loss_sum / total_n)
             global_gradient = gradient_sum / total_n
-            weights -= learning_rate * global_gradient
+            if epoch < epochs:
+                weights -= learning_rate * global_gradient
     return weights, history, time.perf_counter() - start
 
 
@@ -99,7 +113,7 @@ def prepare_data(path: Path, sample_size: int, seed: int, test_size: float) -> t
         raise ValueError("Menos de duas corridas válidas após o pré-processamento.")
     if sample_size > 0 and len(frame) > sample_size:
         frame = frame.sample(n=sample_size, random_state=seed)
-    y = (frame.tip_amount.to_numpy() / frame.fare_amount.to_numpy() >= 0.20).astype(np.float64)
+    y = tip_labels(frame.tip_amount.to_numpy(), frame.fare_amount.to_numpy())
     X = frame[FEATURES].to_numpy(dtype=np.float64)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=seed, stratify=y)
     scaler = StandardScaler()
@@ -130,7 +144,7 @@ def save_charts(results: list[dict], output_dir: Path) -> None:
 
     plt.figure(figsize=(8, 5))
     for r in results:
-        plt.plot(range(1, len(r["loss"]) + 1), r["loss"], marker="o", label=f"{r['workers']} worker(s)")
+        plt.plot(range(len(r["loss"])), r["loss"], marker="o", label=f"{r['workers']} worker(s)")
     plt.xlabel("Época")
     plt.ylabel("Binary cross-entropy")
     plt.title("Convergência: sequencial e distribuído")
